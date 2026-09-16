@@ -6,8 +6,10 @@
 
 In `telemetry`, the `Telemetry` struct allows for creating OpenTelemetry providers for traces and logs.
 
-- `Telemetry::default`: create a new instance of `Telemetry` without any layers. This does not initialise anything yet.
-- `Telemetry::initialize`: register the included layers. Use one of the functions below to include different layers.
+- `Telemetry::new`: create a new instance of `Telemetry` without any layers, for the given `service_name`. This does not initialise anything yet. It returns an `Err` when an OTLP exporter cannot be built.
+- `Telemetry::initialize`: register the included layers. Use one of the functions below to include different layers. It returns an `Err` when a global default subscriber is already set.
+
+The `service_name` is attached as the `service.name` resource attribute on every exported span and log record, which is how backends group telemetry per service. It takes precedence over the `OTEL_SERVICE_NAME` environment variable.
 
 ### Layers
 
@@ -20,6 +22,8 @@ Layers are added to capture traces and logs. Each take a `directives: HashMap<St
 ]
 ```
 
+These directives are only a fallback: when `RUST_LOG` is set it is used verbatim and the passed directives are ignored.
+
 The functions to include layers are as follows:
 
 - `Telemetry::include_otel_tracing_layer`
@@ -31,8 +35,7 @@ The functions to include layers are as follows:
 In `http`, a `Tracing` struct is defined that can be used to build a tower::Layer to create a root request span and attach parent context to it. It can then be used in an axum layer.
 
 - `Tracing::new`: create a new instance with a `service_name`.
-- `Tracing::set_tracing_level`: change the default `INFO` tracing level of response spans to `tracing_level`.
-- `Tracing::to_layer`: create a `tower::Layer`.
+- `Tracing::to_layer`: create a `tower::Layer` with the given tracing level for response tracing.
 
 ## Tracing
 
