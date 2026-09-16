@@ -5,12 +5,27 @@ edition = "2024"
 
 [dependencies]
 axum = "0.8.9"
-opentelemetry = "0.32.0"
+opentelemetry = { version = "0.32.0", features = ["logs"] }
 opentelemetry-appender-tracing = "0.32.0"
 opentelemetry-http = "0.32.0"
-opentelemetry-otlp = "0.32.0"
+opentelemetry-otlp = { version = "0.32.0", features = ["grpc-tonic"] }
 opentelemetry_sdk = "0.32.1"
 tower-http = { version = "0.7.1", features = ["trace"] }
 tracing = "0.1.44"
 tracing-opentelemetry = "0.33.0"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+opentelemetry_sdk = { version = "0.32.1", features = ["testing"] }
+rstest = "0.26"
+tokio = { version = "1", features = ["macros", "rt"] }
+tower = { version = "0.5", features = ["util"] }
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+too_many_lines = "allow"
+must_use_candidate = "allow"
+struct_field_names = "allow"
+return-self-not-must-use = "allow"
