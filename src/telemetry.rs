@@ -1,52 +1,50 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 
+use opentelemetry::Value;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
+use opentelemetry_otlp::ExporterBuildError;
+use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
+use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::filter::Directive;
 use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt as _;
-use tracing_subscriber::{EnvFilter, Layer, Registry, fmt};
+use tracing_subscriber::util::{SubscriberInitExt as _, TryInitError};
+use tracing_subscriber::{EnvFilter, Layer as TracingLayer, Registry, fmt};
 
-pub struct Telemetry {
+pub type Layer = Box<dyn TracingLayer<Registry> + Send + Sync>;
+
+pub struct Builder {
     tracer_provider: SdkTracerProvider,
     logger_provider: SdkLoggerProvider,
-    layers: Vec<Box<dyn Layer<Registry> + Send + Sync>>,
+    layers: Vec<Layer>,
 }
 
-fn create_tracer_provider() -> SdkTracerProvider {
+fn create_tracer_provider(resource: Resource) -> Result<SdkTracerProvider, ExporterBuildError> {
     let exporter = opentelemetry_otlp::SpanExporter::builder()
-        .with_http()
-        .build()
-        .expect("building OTel gRPC span exporter should not fail");
+        .with_tonic()
+        .build()?;
 
-    let provider = SdkTracerProvider::builder().with_batch_exporter(exporter);
+    let provider = SdkTracerProvider::builder()
+        .with_resource(resource)
+        .with_batch_exporter(exporter);
 
-    provider.build()
+    Ok(provider.build())
 }
 
-fn create_logger_provider() -> SdkLoggerProvider {
+fn create_logger_provider(resource: Resource) -> Result<SdkLoggerProvider, ExporterBuildError> {
     let exporter = opentelemetry_otlp::LogExporter::builder()
-        .with_http()
-        .build()
-        .expect("building OTel log exporter should not fail");
+        .with_tonic()
+        .build()?;
 
-    let provider = SdkLoggerProvider::builder().with_batch_exporter(exporter);
+    let provider = SdkLoggerProvider::builder()
+        .with_resource(resource)
+        .with_batch_exporter(exporter);
 
-    provider.build()
-}
-
-impl Default for Telemetry {
-    fn default() -> Self {
-        Self {
-            tracer_provider: create_tracer_provider(),
-            logger_provider: create_logger_provider(),
-            layers: vec![],
-        }
-    }
+    Ok(provider.build())
 }
 
 fn create_stdout_layer<T>() -> fmt::Layer<T> {
@@ -62,6 +60,7 @@ fn new_directive(target: &str, level: LevelFilter) -> Directive {
     Directive::from_str(&format!("{target}={level}")).unwrap()
 }
 
+/// `directives` are used only when `RUST_LOG` is missing.
 fn create_otel_filter(directives: &HashMap<String, LevelFilter>) -> EnvFilter {
     EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         let env_filter = EnvFilter::builder()
@@ -76,58 +75,77 @@ fn create_otel_filter(directives: &HashMap<String, LevelFilter>) -> EnvFilter {
     })
 }
 
-impl Telemetry {
-    pub fn include_otel_tracing_layer(&mut self, directives: &HashMap<String, LevelFilter>) {
-        // let no_span_event_filter =
-        //     tracing_subscriber::filter::filter_fn(|metadata| !metadata.is_event());
+impl Builder {
+    pub fn new(service_name: impl Into<Value>) -> Result<Self, ExporterBuildError> {
+        let resource = Resource::builder().with_service_name(service_name).build();
 
-        let otel_tracing_layer = tracing_opentelemetry::layer()
-            .with_tracer(self.tracer_provider.tracer("otel-subscriber"))
-            .with_filter(create_otel_filter(directives)) //.and(no_span_event_filter))
-            .boxed();
-
-        self.layers.push(otel_tracing_layer);
+        Ok(Self {
+            tracer_provider: create_tracer_provider(resource.clone())?,
+            logger_provider: create_logger_provider(resource)?,
+            layers: vec![],
+        })
     }
 
-    pub fn include_stdout_layer(&mut self, directives: &HashMap<String, LevelFilter>) {
-        let stdout_layer = create_stdout_layer::<Registry>()
+    pub fn add_layer(&mut self, layer: Layer) {
+        self.layers.push(layer);
+    }
+
+    pub fn create_tracing_layer(&self, directives: &HashMap<String, LevelFilter>) -> Layer {
+        tracing_opentelemetry::layer()
+            .with_tracer(self.tracer_provider.tracer("otel-subscriber"))
+            .with_filter(create_otel_filter(directives))
+            .boxed()
+    }
+
+    pub fn with_tracing_layer(&mut self, directives: &HashMap<String, LevelFilter>) {
+        self.add_layer(self.create_tracing_layer(directives));
+    }
+
+    pub fn create_stdout_layer(&self, directives: &HashMap<String, LevelFilter>) -> Layer {
+        create_stdout_layer::<Registry>()
             .pretty()
             .with_filter(create_otel_filter(directives))
-            .boxed();
-
-        self.layers.push(stdout_layer);
+            .boxed()
     }
 
-    pub fn include_tracing_bridge_layer(&mut self, directives: &HashMap<String, LevelFilter>) {
-        let tracing_bridge_layer = OpenTelemetryTracingBridge::new(&self.logger_provider)
+    pub fn with_stdout_layer(&mut self, directives: &HashMap<String, LevelFilter>) {
+        self.add_layer(self.create_stdout_layer(directives));
+    }
+
+    pub fn create_tracing_bridge_layer(&self, directives: &HashMap<String, LevelFilter>) -> Layer {
+        OpenTelemetryTracingBridge::new(&self.logger_provider)
             .with_filter(create_otel_filter(directives))
-            .boxed();
-
-        self.layers.push(tracing_bridge_layer);
+            .boxed()
     }
 
-    pub fn initialize(self) -> Guard {
-        let Telemetry {
+    pub fn with_tracing_bridge_layer(&mut self, directives: &HashMap<String, LevelFilter>) {
+        self.add_layer(self.create_tracing_bridge_layer(directives));
+    }
+
+    pub fn initialize(self) -> Result<Telemetry, TryInitError> {
+        let Builder {
             tracer_provider,
             logger_provider,
             layers,
         } = self;
 
-        tracing_subscriber::registry().with(layers).init();
+        tracing_subscriber::registry().with(layers).try_init()?;
+        opentelemetry::global::set_tracer_provider(tracer_provider.clone());
+        opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
 
-        Guard {
+        Ok(Telemetry {
             tracer_provider,
             logger_provider,
-        }
+        })
     }
 }
 
-pub struct Guard {
+pub struct Telemetry {
     tracer_provider: SdkTracerProvider,
     logger_provider: SdkLoggerProvider,
 }
 
-impl Guard {
+impl Telemetry {
     pub fn flush(&self) {
         if let Err(err) = self.tracer_provider.force_flush() {
             eprintln!("Failed to force flush the trace provider: {err:?}");
@@ -139,7 +157,7 @@ impl Guard {
     }
 }
 
-impl Drop for Guard {
+impl Drop for Telemetry {
     fn drop(&mut self) {
         self.flush();
 
@@ -150,5 +168,25 @@ impl Drop for Guard {
         if let Err(error) = self.logger_provider.shutdown() {
             eprintln!("failed to shutdown otel logger provider: {error:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case("tower_http", LevelFilter::ERROR, "tower_http=error")]
+    #[case("h2", LevelFilter::WARN, "h2=warn")]
+    #[case("kleio::http", LevelFilter::DEBUG, "kleio::http=debug")]
+    #[case("hyper", LevelFilter::TRACE, "hyper=trace")]
+    #[case("noisy_crate", LevelFilter::OFF, "noisy_crate=off")]
+    fn new_directive_formats_target_and_level(
+        #[case] target: &str,
+        #[case] level: LevelFilter,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(new_directive(target, level).to_string(), expected);
     }
 }
