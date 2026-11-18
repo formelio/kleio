@@ -2,12 +2,13 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use opentelemetry::Value;
+use opentelemetry::propagation::TextMapCompositePropagator;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::ExporterBuildError;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
-use opentelemetry_sdk::propagation::TraceContextPropagator;
+use opentelemetry_sdk::propagation::{BaggagePropagator, TraceContextPropagator};
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::filter::Directive;
@@ -16,6 +17,13 @@ use tracing_subscriber::util::{SubscriberInitExt as _, TryInitError};
 use tracing_subscriber::{EnvFilter, Layer as TracingLayer, Registry, fmt};
 
 pub type Layer = Box<dyn TracingLayer<Registry> + Send + Sync>;
+
+fn propagator() -> TextMapCompositePropagator {
+    TextMapCompositePropagator::new(vec![
+        Box::new(TraceContextPropagator::new()),
+        Box::new(BaggagePropagator::new()),
+    ])
+}
 
 pub struct Builder {
     tracer_provider: SdkTracerProvider,
@@ -131,7 +139,7 @@ impl Builder {
 
         tracing_subscriber::registry().with(layers).try_init()?;
         opentelemetry::global::set_tracer_provider(tracer_provider.clone());
-        opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+        opentelemetry::global::set_text_map_propagator(propagator());
 
         Ok(Telemetry {
             tracer_provider,
@@ -188,5 +196,59 @@ mod tests {
         #[case] expected: &str,
     ) {
         assert_eq!(new_directive(target, level).to_string(), expected);
+    }
+
+    #[derive(Default)]
+    struct Headers(HashMap<String, String>);
+
+    impl opentelemetry::propagation::Injector for Headers {
+        fn set(&mut self, key: &str, value: String) {
+            self.0.insert(key.to_string(), value);
+        }
+    }
+
+    fn inject(context: &opentelemetry::Context) -> HashMap<String, String> {
+        use opentelemetry::propagation::TextMapPropagator as _;
+
+        let mut headers = Headers::default();
+        propagator().inject_context(context, &mut headers);
+
+        headers.0
+    }
+
+    fn sampled_context() -> opentelemetry::Context {
+        use opentelemetry::trace::{
+            SpanContext, SpanId, TraceContextExt as _, TraceFlags, TraceId, TraceState,
+        };
+
+        opentelemetry::Context::new().with_remote_span_context(SpanContext::new(
+            TraceId::from_hex("4bf92f3577b34da6a3ce929d0e0e4736").unwrap(),
+            SpanId::from_hex("00f067aa0ba902b7").unwrap(),
+            TraceFlags::SAMPLED,
+            true,
+            TraceState::default(),
+        ))
+    }
+
+    #[test]
+    fn omits_the_baggage_header_when_no_baggage_is_set() {
+        let headers = inject(&sampled_context());
+
+        assert!(headers.contains_key("traceparent"));
+        assert!(!headers.contains_key("baggage"));
+    }
+
+    #[test]
+    fn injects_baggage_alongside_the_trace_context() {
+        use opentelemetry::KeyValue;
+        use opentelemetry::baggage::BaggageExt as _;
+
+        let context =
+            sampled_context().with_baggage([KeyValue::new("audit.event.id", "event-1".to_string())]);
+
+        let headers = inject(&context);
+
+        assert!(headers.contains_key("traceparent"));
+        assert_eq!(headers.get("baggage").map(String::as_str), Some("audit.event.id=event-1"));
     }
 }

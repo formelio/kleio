@@ -12,6 +12,8 @@ In `telemetry`, the `Builder` struct allows for creating OpenTelemetry providers
 
 The `service_name` is attached as the `service.name` resource attribute on every exported span and log record, which is how backends group telemetry per service. It takes precedence over the `OTEL_SERVICE_NAME` environment variable.
 
+`Builder::initialize` installs W3C trace context and baggage as the global propagator, matching the OpenTelemetry default of `tracecontext,baggage`.
+
 ### Layers
 
 Layers are added to capture traces and logs. Each takes a `directives: &HashMap<String, LevelFilter>` parameter. This defines the filtering directives to use for the given layer. For example:
