@@ -32,12 +32,18 @@ impl Tracing {
 
 impl<B> tower_http::trace::MakeSpan<B> for Tracing {
     fn make_span(&mut self, request: &axum::http::Request<B>) -> tracing::Span {
+        let http_route = request
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .map(axum::extract::MatchedPath::as_str);
+
         let span = tracing::info_span!(
             "request",
             service.name = self.service_name,
             method = %request.method(),
             uri = %request.uri(),
             version = ?request.version(),
+            http.route = http_route,
         );
 
         let parent_context = self
